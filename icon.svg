@@ -1,4 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="112" fill="#9a5b3c"/>
-  <text x="256" y="370" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="340" fill="#faf8f4">d</text>
+  <rect width="512" height="512" rx="112" fill="#0d0c0b"/>
+  <path d="M150 352 L214 196 L346 146 M214 196 L372 326 L150 352" fill="none" stroke="#e7a86b" stroke-opacity=".5" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#f4ddc4">
+    <circle cx="150" cy="352" r="15"/>
+    <circle cx="214" cy="196" r="17"/>
+    <circle cx="372" cy="326" r="13"/>
+  </g>
+  <path d="M346 70 Q346 146 422 146 Q346 146 346 222 Q346 146 270 146 Q346 146 346 70 Z" fill="#e7a86b"/>
 </svg>

@@ -1,8 +1,8 @@
 'use strict';
 
-// Diário: SPA estática. As entradas vivem num repo privado do GitHub e são lidas e
-// gravadas pela API REST com um token fine-grained guardado só neste navegador.
-// Metadados (título, resumo, tags...) vêm do index.json, que uma Action gera via OpenAI.
+// Diário: SPA estática. As entradas vivem num repo privado do GitHub e são lidas e gravadas
+// pela API REST com um token fine-grained guardado só neste navegador. Uma Action do repo gera
+// index.json (título, tags, área, humor…) e graph.json (afinidade semântica e constelações).
 
 const CFG_KEY = 'diario.cfg';
 const DRAFT_KEY = 'diario.draft';
@@ -10,6 +10,9 @@ const DEFAULT_CFG = { token: '', repo: 'ericopent/diario', branch: 'main' };
 const CACHE_TTL_MS = 30_000;
 const POLL_MS = 20_000;
 const POLL_MAX = 15;
+const AREA_LABEL = { trabalho: 'Trabalho', pessoal: 'Pessoal' };
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
 
 const store = {
   get(key, fallback) {
@@ -21,8 +24,10 @@ const store = {
 };
 
 let cfg = { ...DEFAULT_CFG, ...store.get(CFG_KEY, {}) };
-let cache = null;      // { entries, loadedAt }
+let cache = null;      // { entries, byPath, graph, hasGraph, loadedAt }
 let pollTimer = null;
+let cleanup = null;    // a tela atual pode registrar uma função de saída (parar animação etc.)
+let viewSeq = 0;       // muda a cada navegação; telas assíncronas checam antes de escrever
 
 const $view = document.getElementById('view');
 const $ = sel => $view.querySelector(sel);
@@ -34,7 +39,8 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
 const pad = n => String(n).padStart(2, '0');
 const fold = s => String(s ?? '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
 const wordCount = s => (s.trim().match(/\S+/g) || []).length;
-const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const plural = (n, one, many) => `${n.toLocaleString('pt-BR')} ${n === 1 ? one : many}`;
+const fmtNum = (n, digits = 1) => n.toFixed(digits).replace('.', ',');
 
 function debounce(fn, ms) {
   let t;
@@ -59,9 +65,17 @@ function dateFromPath(path) {
 }
 
 const fmtFull = new Intl.DateTimeFormat('pt-BR', { dateStyle: 'full', timeStyle: 'short' });
-const fmtDay = new Intl.DateTimeFormat('pt-BR', { weekday: 'short', day: 'numeric', month: 'short' });
+const fmtShort = new Intl.DateTimeFormat('pt-BR', { weekday: 'short', day: 'numeric', month: 'short' });
+const fmtDayMonth = new Intl.DateTimeFormat('pt-BR', { day: 'numeric', month: 'short' });
 const fmtTime = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' });
-const fmtMonth = new Intl.DateTimeFormat('pt-BR', { month: 'long', year: 'numeric' });
+const fmtMonthName = new Intl.DateTimeFormat('pt-BR', { month: 'long' });
+const shortWhen = d => `${fmtShort.format(d).replace(/\./g, '')} · ${fmtTime.format(d)}`;
+const dayMonth = d => fmtDayMonth.format(d).replace(/\./g, '');
+
+function greeting(d = new Date()) {
+  const h = d.getHours();
+  return h < 5 ? ['Boa', 'noite'] : h < 12 ? ['Bom', 'dia'] : h < 18 ? ['Boa', 'tarde'] : ['Boa', 'noite'];
+}
 
 function b64encode(text) {
   let bin = '';
@@ -100,6 +114,19 @@ function toast(msg, { href, error } = {}) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.className = ''; }, error ? 7000 : 4000);
 }
+
+// ---------- ícones (traço único 1.6) ----------
+
+const ICONS = {
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',
+  arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
+  back: '<path d="M19 12H5M11 6l-6 6 6 6"/>',
+  close: '<path d="M6 6l12 12M18 6 6 18"/>',
+  sky: '<circle cx="5" cy="17" r="1.6"/><circle cx="10" cy="7" r="1.6"/><circle cx="18" cy="5" r="1.6"/>' +
+    '<circle cx="16" cy="16" r="1.6"/><path d="m5.8 15.5 3.4-7M11.6 6.6l4.8-1.2M17.7 6.6l-1.4 7.8M6.6 16.8l7.8-.6"/>',
+};
+const icon = (name, size = 18) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" ` +
+  `stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
 
 // ---------- GitHub API ----------
 
@@ -143,22 +170,32 @@ const ref = () => `ref=${encodeURIComponent(cfg.branch)}`;
 const encPath = p => p.split('/').map(encodeURIComponent).join('/');
 
 async function loadAll() {
-  const [tree, index] = await Promise.all([
+  const optional = p => p.catch(e => { if (e.status === 404) return null; throw e; });
+  const [tree, index, graph] = await Promise.all([
     gh(`/git/trees/${encodeURIComponent(cfg.branch)}?recursive=1`).then(r => r.json()),
-    gh(`/contents/index.json?${ref()}`, { raw: true }).then(r => r.json())
-      .catch(e => { if (e.status === 404) return { entries: {} }; throw e; }),
+    optional(gh(`/contents/index.json?${ref()}`, { raw: true }).then(r => r.json())),
+    optional(gh(`/contents/graph.json?${ref()}`, { raw: true }).then(r => r.json())),
   ]);
-  const meta = index.entries || {};
+  const meta = index?.entries || {};
+  const g = { links: [], neighbors: {}, clusters: [], ...(graph || {}) };
+  const clusterOf = new Map();
+  for (const c of g.clusters) for (const m of c.members) clusterOf.set(m, c);
   const entries = tree.tree
     .filter(n => n.type === 'blob' && n.path.startsWith('entries/') && n.path.endsWith('.md'))
-    .map(n => ({ ...(meta[n.path] || {}), path: n.path, date: dateFromPath(n.path), enriched: !!meta[n.path] }))
+    .map(n => ({
+      ...(meta[n.path] || {}),
+      path: n.path,
+      date: dateFromPath(n.path),
+      enriched: !!meta[n.path],
+      cluster: clusterOf.get(n.path) || null,
+    }))
     .filter(e => e.date)
     .sort((a, b) => b.date - a.date);
-  cache = { entries, loadedAt: Date.now() };
+  cache = { entries, byPath: new Map(entries.map(e => [e.path, e])), graph: g, hasGraph: !!graph, loadedAt: Date.now() };
   return cache;
 }
 
-const getData = () => (cache && Date.now() - cache.loadedAt < CACHE_TTL_MS ? cache : loadAll());
+const getData = () => (cache && Date.now() - cache.loadedAt < CACHE_TTL_MS ? Promise.resolve(cache) : loadAll());
 
 async function getEntry(path) {
   const json = await gh(`/contents/${encPath(path)}?${ref()}`).then(r => r.json());
@@ -183,86 +220,170 @@ function deleteEntry(path, sha) {
 
 // ---------- pedaços de UI ----------
 
-const tagLink = (t, key = 'tag') =>
-  `<a class="tag" href="#/entradas?${key}=${encodeURIComponent(t)}">${esc(t)}</a>`;
-const tagSpan = t => `<span class="tag">${esc(t)}</span>`;
-const errorBox = e => `<p class="error-box">${esc(errMsg(e))}</p>`;
+const errorBox = e => `<p class="error-box">${esc(e instanceof ApiError || !e?.message ? errMsg(e) : e.message)}</p>`;
 
-function whenLabel(e) {
-  return `${fmtDay.format(e.date)} · ${fmtTime.format(e.date)}`;
+function segHtml(opts, active) {
+  return opts.map(o => `<button type="button" role="tab" aria-selected="${o.v === active}" data-v="${esc(o.v)}">` +
+    `${o.dot ? `<i class="dot dot-${o.dot}"></i>` : ''}${esc(o.label)}` +
+    `${o.n != null ? `<span class="n">${o.n}</span>` : ''}</button>`).join('');
 }
 
-function itemHtml(e) {
-  const title = e.enriched
-    ? `<h3>${esc(e.title)}</h3>`
-    : '<h3 class="pending">aguardando a IA…</h3>';
-  return `
-    <a class="item" href="#/e/${encodeURIComponent(e.path)}">
-      <div class="item-head">
-        <span>${esc(whenLabel(e))}</span>
-        ${e.kind ? `<span class="kind">${esc(e.kind)}</span>` : ''}
+function moodMeter(v, mood) {
+  if (typeof v !== 'number') return '';
+  const lvl = v + 3;
+  const label = `humor: ${mood || ''} (${v > 0 ? '+' : ''}${v})`;
+  return `<span class="meter" title="${esc(label)}" aria-label="${esc(label)}">` +
+    `${[1, 2, 3, 4, 5].map(i => `<i${i <= lvl ? ' class="on"' : ''}></i>`).join('')}</span>`;
+}
+
+function cardHtml(e, i) {
+  const href = `#/e/${encodeURIComponent(e.path)}`;
+  const style = `style="--i:${Math.min(i, 14)}"`;
+  if (!e.enriched) {
+    return `<a class="card is-pending" href="${href}" ${style}>
+        <div class="card-top"><span class="when">${esc(shortWhen(e.date))}</span></div>
+        <p class="pending-label">a IA está lendo…</p><span class="sk"></span><span class="sk short"></span>
+      </a>`;
+  }
+  return `<a class="card" href="${href}" ${style}>
+      <div class="card-top">
+        <span class="when"><i class="dot dot-${esc(e.area || 'none')}"></i>${esc(shortWhen(e.date))}</span>
+        <span class="kind">${esc(e.kind || '')}</span>
       </div>
-      ${title}
+      <h3>${esc(e.title)}</h3>
       ${e.summary ? `<p class="summary">${esc(e.summary)}</p>` : ''}
-      ${e.tags?.length ? `<div class="tags">${e.tags.map(tagSpan).join('')}</div>` : ''}
+      <div class="card-foot">
+        <div class="tags">${(e.tags || []).slice(0, 4).map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>
+        ${moodMeter(e.valence, e.mood)}
+      </div>
     </a>`;
 }
 
-// ---------- telas ----------
+const skeletonCards = n => `<div class="masonry" style="--cols:1">${'<div class="card is-skeleton"><span class="sk"></span><span class="sk tall"></span><span class="sk short"></span></div>'.repeat(n)}</div>`;
+
+function masonry(cards) {
+  const w = $view.clientWidth;
+  const n = w >= 1080 ? 3 : w >= 700 ? 2 : 1;
+  const cols = Array.from({ length: n }, () => []);
+  cards.forEach((c, i) => cols[i % n].push(c));  // round-robin: a ordem cronológica lê da esquerda p/ direita
+  return `<div class="masonry" style="--cols:${n}">${cols.map(c => `<div class="col">${c.join('')}</div>`).join('')}</div>`;
+}
+
+function spotlight(container) {
+  container.addEventListener('pointermove', ev => {
+    const card = ev.target.closest('.card, .near-card');
+    if (!card) return;
+    const r = card.getBoundingClientRect();
+    card.style.setProperty('--mx', `${ev.clientX - r.left}px`);
+    card.style.setProperty('--my', `${ev.clientY - r.top}px`);
+  });
+}
+
+function bindCtrlEnter(ta, btn) {
+  ta.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); btn.click(); }
+  });
+}
+
+// ---------- Escrever ----------
 
 function viewWrite() {
   const draft = store.get(DRAFT_KEY, '');
+  const [g1, g2] = greeting();
   $view.innerHTML = `
-    <section class="write">
-      <p class="when">${esc(fmtFull.format(new Date()))}</p>
-      <textarea id="body" class="paper" placeholder="O que está passando pela sua cabeça?" aria-label="Texto da entrada">${esc(draft)}</textarea>
-      <div class="bar">
-        <span id="count" class="muted"></span>
-        <button id="save" class="primary" type="button">Salvar</button>
+    <section class="page narrow compose">
+      <header class="page-head">
+        <p class="eyebrow">${esc(fmtFull.format(new Date()))}</p>
+        <h1 class="display">${g1} <em>${g2}</em>.</h1>
+      </header>
+      <div class="composer">
+        <textarea id="body" class="paper" placeholder="O que está passando pela sua cabeça?" aria-label="Texto do pensamento">${esc(draft)}</textarea>
+        <div class="composer-bar">
+          <span id="count" class="hint"></span>
+          <button id="save" class="btn btn-primary" type="button">Guardar</button>
+        </div>
       </div>
+      <section class="recent" id="recent" aria-label="Pensamentos recentes"></section>
     </section>`;
   const ta = $('#body'), count = $('#count'), btn = $('#save');
   const update = () => {
     const n = wordCount(ta.value);
-    count.textContent = n ? plural(n, 'palavra', 'palavras') : 'Ctrl+Enter salva';
+    count.textContent = n ? plural(n, 'palavra', 'palavras') : `${isMac ? '⌘' : 'Ctrl'} + Enter guarda`;
     btn.disabled = !ta.value.trim();
     autosize(ta);
   };
   ta.addEventListener('input', () => { store.set(DRAFT_KEY, ta.value); update(); });
-  ta.addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); btn.click(); }
-  });
+  bindCtrlEnter(ta, btn);
   btn.addEventListener('click', async () => {
     const body = ta.value.trim();
     if (!body) return;
     btn.disabled = true;
-    btn.textContent = 'Salvando…';
+    btn.textContent = 'Guardando…';
     const now = new Date();
     const path = entryPath(now);
     try {
       await putEntry(path, serializeEntry({ created: isoLocal(now) }, body), null, `entrada ${entryId(now)}`);
       store.del(DRAFT_KEY);
       ta.value = '';
-      toast('Salvo. As tags chegam em ~1 min.', { href: `#/e/${encodeURIComponent(path)}` });
+      toast('Guardado. A IA organiza em ~1 min.', { href: `#/e/${encodeURIComponent(path)}` });
+      renderRecent(viewSeq);
     } catch (e) {
       toast(errMsg(e), { error: true });
     } finally {
-      btn.textContent = 'Salvar';
+      btn.textContent = 'Guardar';
       update();
     }
   });
   update();
   ta.focus();
   ta.setSelectionRange(ta.value.length, ta.value.length);
+  renderRecent(viewSeq);
 }
 
-const FILTERS = [['tag', 'tag'], ['pessoa', 'pessoa'], ['lugar', 'lugar'], ['tipo', 'tipo']];
+async function renderRecent(seq) {
+  let data;
+  try { data = await getData(); } catch { return; }
+  const box = $('#recent');
+  if (seq !== viewSeq || !box || !data.entries.length) return;
+  box.innerHTML = `
+    <div class="section-head"><h2 class="section-label">Recentes</h2>
+      <a class="link" href="#/pensamentos">Ver todos ${icon('arrow', 14)}</a></div>
+    <ul class="recent-list">${data.entries.slice(0, 4).map((e, i) => `
+      <li style="--i:${i}"><a href="#/e/${encodeURIComponent(e.path)}">
+        <span class="when">${e.area ? `<i class="dot dot-${esc(e.area)}"></i>` : ''}${esc(shortWhen(e.date))}</span>
+        <span class="t">${e.enriched ? esc(e.title) : '<em>a IA está lendo…</em>'}</span>${icon('arrow', 16)}
+      </a></li>`).join('')}</ul>`;
+}
 
-function matches(e, f, q) {
-  if (f.tag && !e.tags?.includes(f.tag)) return false;
+// ---------- Pensamentos ----------
+
+function parseFilters(qs) {
+  const p = new URLSearchParams(qs || '');
+  return {
+    area: AREA_LABEL[p.get('area')] ? p.get('area') : '',
+    tags: (p.get('tags') || p.get('tag') || '').split(',').filter(Boolean),
+    pessoa: p.get('pessoa') || '',
+    lugar: p.get('lugar') || '',
+    tipo: p.get('tipo') || '',
+    q: p.get('q') || '',
+  };
+}
+
+function filtersQs(f) {
+  const p = new URLSearchParams();
+  for (const k of ['area', 'pessoa', 'lugar', 'tipo', 'q']) if (f[k]) p.set(k, f[k]);
+  if (f.tags.length) p.set('tags', f.tags.join(','));
+  const s = p.toString();
+  return s ? `?${s}` : '';
+}
+
+function matches(e, f, { ignoreArea = false } = {}) {
+  if (!ignoreArea && f.area && e.area !== f.area) return false;
+  if (f.tags.length && !f.tags.every(t => e.tags?.includes(t))) return false;
   if (f.pessoa && !e.people?.includes(f.pessoa)) return false;
   if (f.lugar && !e.places?.includes(f.lugar)) return false;
   if (f.tipo && e.kind !== f.tipo) return false;
+  const q = fold(f.q.trim());
   if (!q) return true;
   const hay = fold([e.title, e.summary, e.excerpt, e.mood, e.kind, ...(e.tags || []),
     ...(e.people || []), ...(e.places || [])].join(' '));
@@ -270,158 +391,226 @@ function matches(e, f, q) {
 }
 
 async function viewList(qs) {
-  const params = new URLSearchParams(qs || '');
-  const f = Object.fromEntries(FILTERS.map(([k]) => [k, params.get(k) || '']));
-  const active = FILTERS.filter(([k]) => f[k]);
+  const seq = viewSeq;
+  const f = parseFilters(qs);
   $view.innerHTML = `
-    <section class="list">
-      <input id="q" type="search" placeholder="Buscar em títulos, resumos, tags, pessoas…" aria-label="Buscar" autocomplete="off">
-      ${active.length ? `<div class="filters">${active.map(([k, label]) =>
-        `<a class="chip" href="#/entradas" title="Remover filtro">${esc(label)}: ${esc(f[k])} <span aria-hidden="true">×</span></a>`).join('')}</div>` : ''}
-      <p id="stats" class="muted"></p>
-      <div id="items"><p class="muted">Carregando…</p></div>
+    <section class="page wide">
+      <header class="page-head">
+        <p class="eyebrow" id="stats">&nbsp;</p>
+        <h1 class="display">Seus <em>pensamentos</em></h1>
+      </header>
+      <div class="toolbar">
+        <div class="seg" id="seg" role="tablist" aria-label="Área"></div>
+        <label class="search">${icon('search')}<input id="q" type="search" placeholder="Buscar em títulos, resumos, pessoas…" value="${esc(f.q)}" autocomplete="off" aria-label="Buscar"></label>
+      </div>
+      <div class="suggest" id="chips"></div>
+      <div id="feed" class="feed">${skeletonCards(3)}</div>
     </section>`;
   let data;
-  try { data = await getData(); } catch (e) { $('#items').innerHTML = errorBox(e); return; }
-  const qInput = $('#q');
+  try { data = await getData(); } catch (e) { if (seq === viewSeq) $('#feed').innerHTML = errorBox(e); return; }
+  if (seq !== viewSeq) return;
+  const feed = $('#feed'), qInput = $('#q');
+  let animate = true;
 
-  const render = () => {
-    const q = fold(qInput.value.trim());
-    const shown = data.entries.filter(e => matches(e, f, q));
+  const sync = () => history.replaceState(null, '', `#/pensamentos${filtersQs(f)}`);
+
+  const renderControls = () => {
+    const base = data.entries.filter(e => matches(e, f, { ignoreArea: true }));
+    const n = a => base.filter(e => !a || e.area === a).length;
+    $('#seg').innerHTML = segHtml([
+      { v: '', label: 'Tudo', n: n('') },
+      { v: 'trabalho', label: 'Trabalho', n: n('trabalho'), dot: 'trabalho' },
+      { v: 'pessoal', label: 'Pessoal', n: n('pessoal'), dot: 'pessoal' },
+    ], f.area);
+    const counts = new Map();
+    for (const e of data.entries) if (!f.area || e.area === f.area) for (const t of e.tags || []) counts.set(t, (counts.get(t) || 0) + 1);
+    const top = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'pt-BR')).slice(0, 14).map(([t]) => t);
+    const shown = [...f.tags, ...top.filter(t => !f.tags.includes(t))];
+    const extra = [['pessoa', f.pessoa], ['lugar', f.lugar], ['tipo', f.tipo]].filter(([, v]) => v);
+    $('#chips').innerHTML =
+      extra.map(([k, v]) => `<button type="button" class="chip on" data-clear="${k}">${k}: ${esc(v)} ${icon('close', 12)}</button>`).join('') +
+      shown.map(t => {
+        const on = f.tags.includes(t);
+        return `<button type="button" class="chip${on ? ' on' : ''}" data-tag="${esc(t)}" aria-pressed="${on}">` +
+          `${on ? '' : '<span class="arr">↳</span>'}${esc(t)}<span class="n">${counts.get(t) || 0}</span>${on ? icon('close', 12) : ''}</button>`;
+      }).join('');
+  };
+
+  const renderFeed = () => {
+    const shown = data.entries.filter(e => matches(e, f));
     const words = shown.reduce((s, e) => s + (e.words || 0), 0);
     $('#stats').textContent = shown.length
-      ? `${plural(shown.length, 'entrada', 'entradas')}${words ? ` · ${words.toLocaleString('pt-BR')} palavras` : ''}`
-      : '';
+      ? `${plural(shown.length, 'pensamento', 'pensamentos')}${words ? ` · ${plural(words, 'palavra', 'palavras')}` : ''}`
+      : ' ';
     if (!shown.length) {
-      $('#items').innerHTML = data.entries.length
-        ? '<p class="empty">Nada encontrado.</p>'
-        : '<p class="empty">Nenhuma entrada ainda. <a href="#/">Escreva a primeira.</a></p>';
+      feed.innerHTML = data.entries.length
+        ? `<div class="empty"><p class="display sm">Nada <em>por aqui</em>.</p><p>Nenhum pensamento com esses filtros.</p><a class="btn btn-secondary" href="#/pensamentos">Limpar filtros</a></div>`
+        : `<div class="empty"><p class="display sm">Nenhum <em>pensamento</em> ainda.</p><p>Escreva o primeiro; a IA organiza o resto.</p><a class="btn btn-primary" href="#/">Escrever</a></div>`;
       return;
     }
-    let html = '', month = '';
+    const months = [];
     for (const e of shown) {
-      const m = fmtMonth.format(e.date);
-      if (m !== month) { html += `<h2 class="month">${esc(m)}</h2>`; month = m; }
-      html += itemHtml(e);
+      const key = `${e.date.getFullYear()}-${e.date.getMonth()}`;
+      if (months.at(-1)?.key !== key) months.push({ key, date: e.date, items: [] });
+      months.at(-1).items.push(e);
     }
-    $('#items').innerHTML = html;
+    let i = 0;
+    feed.innerHTML = months.map(m => `
+      <section class="month">
+        <h2 class="month-label">${esc(fmtMonthName.format(m.date))} <span>${m.date.getFullYear()}</span></h2>
+        ${masonry(m.items.map(e => cardHtml(e, i++)))}
+      </section>`).join('');
+    feed.classList.toggle('animate', animate && !reduceMotion.matches);
+    animate = false;
   };
-  qInput.addEventListener('input', debounce(render, 120));
-  render();
 
-  // Entradas recém-salvas ficam "aguardando a IA" até a Action rodar: recarrega sozinho.
+  const renderAll = () => { renderControls(); renderFeed(); };
+
+  $('#seg').addEventListener('click', ev => {
+    const b = ev.target.closest('[data-v]');
+    if (!b) return;
+    f.area = b.dataset.v;
+    animate = true;
+    sync(); renderAll();
+  });
+  $('#chips').addEventListener('click', ev => {
+    const b = ev.target.closest('button');
+    if (!b) return;
+    if (b.dataset.clear) f[b.dataset.clear] = '';
+    else if (b.dataset.tag) {
+      const t = b.dataset.tag;
+      f.tags = f.tags.includes(t) ? f.tags.filter(x => x !== t) : [...f.tags, t];
+    }
+    animate = true;
+    sync(); renderAll();
+  });
+  qInput.addEventListener('input', debounce(() => { f.q = qInput.value; sync(); renderControls(); renderFeed(); }, 140));
+  spotlight(feed);
+  const onResize = debounce(renderFeed, 160);
+  window.addEventListener('resize', onResize);
+  cleanup = () => window.removeEventListener('resize', onResize);
+  renderAll();
+
+  // Pensamentos recém-guardados ficam "a IA está lendo…" até a Action rodar: recarrega sozinho.
   let polls = 0;
   if (data.entries.some(e => !e.enriched)) {
     pollTimer = setInterval(async () => {
       if (++polls > POLL_MAX) { clearInterval(pollTimer); return; }
       try { data = await loadAll(); } catch { return; }
-      render();
+      if (seq !== viewSeq) return;
+      renderAll();
       if (!data.entries.some(e => !e.enriched)) clearInterval(pollTimer);
     }, POLL_MS);
   }
 }
 
+// ---------- Pensamento ----------
+
 async function viewEntry(rawPath) {
+  const seq = viewSeq;
   const path = decodeURIComponent(rawPath);
-  $view.innerHTML = '<p class="muted">Carregando…</p>';
+  $view.innerHTML = `<article class="page narrow reading"><span class="sk short"></span><span class="sk tall"></span><span class="sk"></span><span class="sk"></span><span class="sk short"></span></article>`;
   let file, data;
   try {
     [file, data] = await Promise.all([getEntry(path), getData().catch(() => null)]);
-  } catch (e) { $view.innerHTML = errorBox(e); return; }
-  const e = data?.entries.find(x => x.path === path) || { date: dateFromPath(path) };
+  } catch (e) { if (seq === viewSeq) $view.firstElementChild.innerHTML = errorBox(e); return; }
+  if (seq !== viewSeq) return;
+  const e = data?.byPath.get(path) || { date: dateFromPath(path) };
   const stale = e.enriched && e.updated !== (file.meta.updated || '');
-  const facts = [e.kind, e.mood].filter(Boolean).map(esc).join(' · ');
-  const people = (e.people || []).map(p => tagLink(p, 'pessoa')).join('');
-  const places = (e.places || []).map(p => tagLink(p, 'lugar')).join('');
-  $view.innerHTML = `
-    <article class="entry">
-      <p class="when">${esc(fmtFull.format(e.date))}${file.meta.updated ? ' · editada' : ''}</p>
-      <h1 class="${e.enriched ? '' : 'pending'}">${e.enriched ? esc(e.title) : 'aguardando a IA…'}</h1>
-      ${facts ? `<p class="facts">${facts}${stale ? ' · <em>metadados sendo atualizados</em>' : ''}</p>` : ''}
-      ${e.tags?.length ? `<div class="tags">${e.tags.map(t => tagLink(t)).join('')}</div>` : ''}
-      <div class="body">${esc(file.body)}</div>
-      ${people ? `<p class="refs"><span class="muted">Pessoas</span> ${people}</p>` : ''}
-      ${places ? `<p class="refs"><span class="muted">Lugares</span> ${places}</p>` : ''}
-      <div class="actions">
-        <a class="btn" href="#/editar/${encodeURIComponent(path)}">Editar</a>
-        <button id="del" class="ghost danger" type="button">Apagar</button>
-      </div>
-    </article>`;
-  $('#del').addEventListener('click', async () => {
-    if (!confirm('Apagar esta entrada? Ela continua no histórico de commits do repo.')) return;
+  const near = (data?.graph.neighbors?.[path] || [])
+    .map(([p, s]) => [data.byPath.get(p), s]).filter(([x]) => x?.enriched).slice(0, 4);
+  const tagLinks = (list, key) => (list || []).map(t =>
+    `<a class="tag" href="#/pensamentos?${key}=${encodeURIComponent(t)}">${esc(t)}</a>`).join('');
+  const cluster = e.cluster?.name && e.cluster.members.length > 1 ? e.cluster : null;
+  $view.firstElementChild.innerHTML = `
+    <a class="back" href="#/pensamentos">${icon('back', 16)} Pensamentos</a>
+    <p class="eyebrow">${esc(fmtFull.format(e.date))}${file.meta.updated ? ' · editado' : ''}</p>
+    <h1 class="title${e.enriched ? '' : ' is-pending'}">${e.enriched ? esc(e.title) : 'A IA ainda está lendo…'}</h1>
+    ${e.enriched ? `<div class="meta-row">
+      ${e.area ? `<a class="pill" href="#/pensamentos?area=${e.area}"><i class="dot dot-${e.area}"></i>${AREA_LABEL[e.area]}</a>` : ''}
+      ${e.kind ? `<a class="pill" href="#/pensamentos?tipo=${encodeURIComponent(e.kind)}">${esc(e.kind)}</a>` : ''}
+      ${e.mood ? `<span class="pill">${esc(e.mood)}${moodMeter(e.valence, e.mood)}</span>` : ''}
+      ${stale ? '<span class="pill ghost">atualizando metadados…</span>' : ''}
+    </div>` : ''}
+    ${e.tags?.length ? `<div class="tags">${tagLinks(e.tags, 'tags')}</div>` : ''}
+    <div class="prose">${esc(file.body)}</div>
+    ${e.people?.length ? `<p class="refs"><span>Pessoas</span>${tagLinks(e.people, 'pessoa')}</p>` : ''}
+    ${e.places?.length ? `<p class="refs"><span>Lugares</span>${tagLinks(e.places, 'lugar')}</p>` : ''}
+    ${near.length || cluster ? `<section class="near">
+      <div class="section-head"><h2 class="section-label">Pensamentos próximos</h2>
+        ${cluster ? `<a class="link" href="#/constelacao?e=${encodeURIComponent(path)}">${icon('sky', 15)} constelação <em>${esc(cluster.name)}</em></a>` : ''}</div>
+      <div class="near-grid">${near.map(([x, s]) => `
+        <a class="near-card" href="#/e/${encodeURIComponent(x.path)}" title="afinidade semântica ${Math.round(s * 100)}%">
+          <span class="when"><i class="dot dot-${esc(x.area || 'none')}"></i>${esc(dayMonth(x.date))}<span class="num">${Math.round(s * 100)}%</span></span>
+          <span class="t">${esc(x.title)}</span>
+        </a>`).join('')}</div>
+    </section>` : ''}
+    <div class="actions">
+      <a class="btn btn-secondary" href="#/editar/${encodeURIComponent(path)}">Editar</a>
+      <button id="del" class="btn btn-text danger" type="button">Apagar</button>
+    </div>`;
+  spotlight($view.firstElementChild);
+  const del = $('#del');
+  let armed = null;
+  del.addEventListener('click', async () => {
+    if (!armed) {  // primeiro clique arma; o segundo, em até 4 s, apaga
+      del.textContent = 'Confirmar: apagar de vez';
+      del.classList.add('armed');
+      armed = setTimeout(() => { armed = null; del.textContent = 'Apagar'; del.classList.remove('armed'); }, 4000);
+      return;
+    }
+    clearTimeout(armed);
+    del.disabled = true;
     try {
       await deleteEntry(path, file.sha);
-      toast('Entrada apagada.');
-      location.hash = '#/entradas';
-    } catch (err) { toast(errMsg(err), { error: true }); }
+      toast('Pensamento apagado. Ele continua no histórico de commits do repo.');
+      location.hash = '#/pensamentos';
+    } catch (err) { toast(errMsg(err), { error: true }); del.disabled = false; }
   });
 }
 
 async function viewEdit(rawPath) {
+  const seq = viewSeq;
   const path = decodeURIComponent(rawPath);
-  $view.innerHTML = '<p class="muted">Carregando…</p>';
+  $view.innerHTML = '<section class="page narrow compose"><span class="sk short"></span><span class="sk tall"></span></section>';
   let file;
-  try { file = await getEntry(path); } catch (e) { $view.innerHTML = errorBox(e); return; }
-  const date = dateFromPath(path);
-  $view.innerHTML = `
-    <section class="write">
-      <p class="when">Editando · ${esc(fmtFull.format(date))}</p>
-      <textarea id="body" class="paper" aria-label="Texto da entrada">${esc(file.body)}</textarea>
-      <div class="bar">
-        <a class="ghost" href="#/e/${encodeURIComponent(path)}">Cancelar</a>
-        <button id="save" class="primary" type="button">Salvar alterações</button>
+  try { file = await getEntry(path); } catch (e) { if (seq === viewSeq) $view.firstElementChild.innerHTML = errorBox(e); return; }
+  if (seq !== viewSeq) return;
+  $view.firstElementChild.innerHTML = `
+    <a class="back" href="#/e/${encodeURIComponent(path)}">${icon('back', 16)} Voltar</a>
+    <header class="page-head">
+      <p class="eyebrow">${esc(fmtFull.format(dateFromPath(path)))}</p>
+      <h1 class="display">Editando<em>.</em></h1>
+    </header>
+    <div class="composer">
+      <textarea id="body" class="paper" aria-label="Texto do pensamento">${esc(file.body)}</textarea>
+      <div class="composer-bar">
+        <span class="hint">a IA reorganiza depois de guardar</span>
+        <button id="save" class="btn btn-primary" type="button">Guardar alterações</button>
       </div>
-    </section>`;
+    </div>`;
   const ta = $('#body'), btn = $('#save');
   ta.addEventListener('input', () => { btn.disabled = !ta.value.trim(); autosize(ta); });
-  ta.addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); btn.click(); }
-  });
+  bindCtrlEnter(ta, btn);
   btn.addEventListener('click', async () => {
     btn.disabled = true;
-    btn.textContent = 'Salvando…';
-    const meta = { ...file.meta, updated: isoLocal(new Date()) };
+    btn.textContent = 'Guardando…';
     try {
-      await putEntry(path, serializeEntry(meta, ta.value), file.sha, `edita ${path.split('/').pop()}`);
-      toast('Alterações salvas. Metadados atualizam em ~1 min.');
+      await putEntry(path, serializeEntry({ ...file.meta, updated: isoLocal(new Date()) }, ta.value),
+        file.sha, `edita ${path.split('/').pop()}`);
+      toast('Alterações guardadas. Metadados atualizam em ~1 min.');
       location.hash = `#/e/${encodeURIComponent(path)}`;
     } catch (e) {
       toast(errMsg(e), { error: true });
       btn.disabled = false;
-      btn.textContent = 'Salvar alterações';
+      btn.textContent = 'Guardar alterações';
     }
   });
   autosize(ta);
   ta.focus();
 }
 
-function cloud(counts, key) {
-  const list = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'pt-BR'));
-  if (!list.length) return '<p class="muted">Nada ainda.</p>';
-  const max = Math.log(list[0][1]);
-  return `<div class="cloud">${list.map(([t, n]) => {
-    const size = max > 0 ? 0.85 + 0.5 * (Math.log(n) / max) : 0.9;
-    return `<a class="tag" style="font-size:${size.toFixed(2)}rem" href="#/entradas?${key}=${encodeURIComponent(t)}">${esc(t)} <span class="n">${n}</span></a>`;
-  }).join('')}</div>`;
-}
-
-async function viewTags() {
-  $view.innerHTML = '<p class="muted">Carregando…</p>';
-  let data;
-  try { data = await getData(); } catch (e) { $view.innerHTML = errorBox(e); return; }
-  const count = field => {
-    const m = new Map();
-    for (const e of data.entries) for (const v of [e[field]].flat().filter(Boolean)) m.set(v, (m.get(v) || 0) + 1);
-    return m;
-  };
-  $view.innerHTML = `
-    <section class="tags-view">
-      <h2 class="month">Tags</h2>${cloud(count('tags'), 'tag')}
-      <h2 class="month">Tipos</h2>${cloud(count('kind'), 'tipo')}
-      <h2 class="month">Pessoas</h2>${cloud(count('people'), 'pessoa')}
-      <h2 class="month">Lugares</h2>${cloud(count('places'), 'lugar')}
-    </section>`;
-}
+// ---------- Configuração ----------
 
 // Testa token → repo → conteúdo, um passo por vez, para o erro dizer o que ajustar no token.
 async function diagnose() {
@@ -458,24 +647,29 @@ async function diagnose() {
 
 function viewConfig() {
   $view.innerHTML = `
-    <section class="config">
-      <h1>Configuração</h1>
-      <p>As entradas ficam no repositório <b>privado</b> abaixo. Este app (público) não guarda
-        nada: ele lê e grava lá usando um token que fica só neste navegador.</p>
-      <ol class="steps">
-        <li>Abra <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>.</li>
-        <li><i>Repository access</i> → <i>Only select repositories</i> → o repo do diário.</li>
-        <li><i>Permissions</i> → <i>Repository</i> → <b>Contents: Read and write</b>.</li>
-        <li>Gere o token e cole aqui. Faça o mesmo em cada aparelho.</li>
-      </ol>
-      <label>Token<input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…"></label>
-      <label>Repositório<input id="repo" autocomplete="off" spellcheck="false"></label>
-      <label>Branch<input id="branch" autocomplete="off" spellcheck="false"></label>
-      <div class="actions">
-        <button id="test" class="primary" type="button">Salvar e testar</button>
-        <button id="forget" class="ghost" type="button">Esquecer token</button>
+    <section class="page narrow config">
+      <header class="page-head">
+        <p class="eyebrow">conexão com o GitHub</p>
+        <h1 class="display">Configu<em>ração</em></h1>
+      </header>
+      <div class="panel">
+        <p>Os pensamentos ficam no repositório <b>privado</b> abaixo. Este app (público) não guarda
+          nada: ele lê e grava lá com um token que fica só neste navegador.</p>
+        <ol class="steps">
+          <li>Abra <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>.</li>
+          <li><i>Repository access</i> → <i>Only select repositories</i> → o repo do diário.</li>
+          <li><i>Permissions</i> → <i>Repository</i> → <b>Contents: Read and write</b>.</li>
+          <li>Gere o token e cole aqui. Faça o mesmo em cada aparelho.</li>
+        </ol>
+        <label>Token<input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…"></label>
+        <label>Repositório<input id="repo" autocomplete="off" spellcheck="false"></label>
+        <label>Branch<input id="branch" autocomplete="off" spellcheck="false"></label>
+        <div class="actions">
+          <button id="test" class="btn btn-primary" type="button">Guardar e testar</button>
+          <button id="forget" class="btn btn-text" type="button">Esquecer token</button>
+        </div>
+        <p id="status" class="status"></p>
       </div>
-      <p id="status" class="muted"></p>
     </section>`;
   const token = $('#token'), repo = $('#repo'), branch = $('#branch'), status = $('#status');
   token.value = cfg.token;
@@ -487,21 +681,24 @@ function viewConfig() {
     store.set(CFG_KEY, cfg);
     repo.value = cfg.repo;
     cache = null;
+    status.className = 'status';
     status.textContent = 'Testando…';
     try {
       const r = await diagnose();
+      status.className = `status ${r.error || !r.info.private ? 'bad' : 'ok'}`;
       status.innerHTML = r.error
-        ? `<span class="danger">${esc(r.error)}</span>`
+        ? esc(r.error)
         : r.info.private
-          ? `Conectado a <b>${esc(r.info.full_name)}</b> (privado) · ${plural(r.entries.length, 'entrada', 'entradas')}.`
-          : `<span class="danger">Atenção: ${esc(r.info.full_name)} é <b>público</b>. Torne-o privado antes de escrever.</span>`;
-    } catch (e) { status.innerHTML = `<span class="danger">${esc(errMsg(e))}</span>`; }
+          ? `Conectado a <b>${esc(r.info.full_name)}</b> (privado) · ${plural(r.entries.length, 'pensamento', 'pensamentos')}.`
+          : `Atenção: ${esc(r.info.full_name)} é <b>público</b>. Torne-o privado antes de escrever.`;
+    } catch (e) { status.className = 'status bad'; status.textContent = errMsg(e); }
   });
   $('#forget').addEventListener('click', () => {
     cfg = { ...cfg, token: '' };
     store.set(CFG_KEY, cfg);
     cache = null;
     token.value = '';
+    status.className = 'status';
     status.textContent = 'Token removido deste navegador.';
   });
 }
@@ -510,28 +707,38 @@ function viewConfig() {
 
 const ROUTES = [
   [/^#?\/?$/, viewWrite, 'write'],
-  [/^#\/entradas(?:\?(.*))?$/, viewList, 'list'],
+  [/^#\/pensamentos(?:\?(.*))?$/, viewList, 'list'],
+  [/^#\/entradas(?:\?(.*))?$/, qs => location.replace(`#/pensamentos${qs ? `?${qs}` : ''}`), 'list'],
+  [/^#\/constelacao(?:\?(.*))?$/, qs => viewSky(qs), 'sky'],
+  [/^#\/tags$/, () => location.replace('#/constelacao?modo=tags'), 'sky'],
   [/^#\/e\/(.+)$/, viewEntry, 'list'],
   [/^#\/editar\/(.+)$/, viewEdit, 'list'],
-  [/^#\/tags$/, viewTags, 'tags'],
   [/^#\/config$/, viewConfig, 'config'],
 ];
 
+let routed = false;
 function route() {
   clearInterval(pollTimer);
   const hash = location.hash || '#/';
   if (!cfg.token && hash !== '#/config') { location.hash = '#/config'; return; }
-  for (const [re, view, nav] of ROUTES) {
-    const m = hash.match(re);
-    if (!m) continue;
-    document.querySelectorAll('[data-nav]').forEach(a =>
-      a.classList.toggle('active', a.dataset.nav === nav));
+  const hit = ROUTES.map(([re, view, nav]) => [hash.match(re), view, nav]).find(([m]) => m);
+  if (!hit) { location.hash = '#/'; return; }
+  const [m, view, nav] = hit;
+  const render = () => {
+    cleanup?.();
+    cleanup = null;
+    viewSeq++;
+    document.querySelectorAll('[data-nav]').forEach(a => {
+      a.classList.toggle('active', a.dataset.nav === nav);
+      if (a.dataset.nav === nav) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+    });
     window.scrollTo(0, 0);
     view(...m.slice(1));
-    return;
-  }
-  location.hash = '#/';
+  };
+  if (routed && document.startViewTransition && !reduceMotion.matches) document.startViewTransition(render);
+  else render();
+  routed = true;
 }
 
 window.addEventListener('hashchange', route);
-route();
+document.addEventListener('DOMContentLoaded', route);  // depois de ambient.js e constellation.js
