@@ -25,6 +25,7 @@ const store = {
 
 let cfg = { ...DEFAULT_CFG, ...store.get(CFG_KEY, {}) };
 let cache = null;      // { entries, byPath, graph, hasGraph, loadedAt }
+const areaChosen = new Map();  // área corrigida nesta sessão, até a Action refletir no index.json
 let pollTimer = null;
 let cleanup = null;    // a tela atual pode registrar uma função de saída (parar animação etc.)
 let viewSeq = 0;       // muda a cada navegação; telas assíncronas checam antes de escrever
@@ -183,6 +184,7 @@ async function loadAll() {
       date: dateFromPath(n.path),
       enriched: !!meta[n.path],
       cluster: clusterOf.get(n.path) || null,
+      ...(areaChosen.has(n.path) ? { area: areaChosen.get(n.path) } : {}),
     }))
     .filter(e => e.date)
     .sort((a, b) => b.date - a.date);
@@ -566,7 +568,9 @@ async function viewEntry(rawPath) {
     <p class="eyebrow">${esc(fmtFull.format(e.date))}${file.meta.updated ? ' · editado' : ''}</p>
     <h1 class="title${e.enriched ? '' : ' is-pending'}">${e.enriched ? esc(e.title) : 'A IA ainda está lendo…'}</h1>
     ${e.enriched ? `<div class="meta-row">
-      ${e.area ? `<a class="pill" href="#/pensamentos?area=${e.area}"><i class="dot dot-${e.area}"></i>${AREA_LABEL[e.area]}</a>` : ''}
+      <div class="seg xs" id="area-pick" role="radiogroup" aria-label="Área: clique para corrigir" title="Corrigir a área: a sua escolha vence a da IA">
+        ${Object.entries(AREA_LABEL).map(([a, label]) => `<button type="button" role="radio" aria-checked="${e.area === a}" data-area="${a}"><i class="dot dot-${a}"></i>${label}</button>`).join('')}
+      </div>
       ${e.kind ? `<a class="pill" href="#/pensamentos?tipo=${encodeURIComponent(e.kind)}">${esc(e.kind)}</a>` : ''}
       ${e.mood ? `<span class="pill">${esc(e.mood)}${moodMeter(e.valence, e.mood)}</span>` : ''}
       ${stale ? '<span class="pill ghost">atualizando metadados…</span>' : ''}
@@ -589,6 +593,32 @@ async function viewEntry(rawPath) {
       <button id="del" class="btn btn-text danger" type="button">Apagar</button>
     </div>`;
   spotlight($view.firstElementChild);
+
+  // Corrigir a área grava "area:" no frontmatter do próprio arquivo; a Action respeita essa
+  // escolha (sem chamar o modelo) e a usa como exemplo para classificar os próximos.
+  $('#area-pick')?.addEventListener('click', async ev => {
+    const b = ev.target.closest('[data-area]');
+    if (!b || b.getAttribute('aria-checked') === 'true') return;
+    const pick = $('#area-pick'), prevArea = e.area, area = b.dataset.area;
+    const mark = a => pick.querySelectorAll('[data-area]').forEach(x => x.setAttribute('aria-checked', String(x.dataset.area === a)));
+    mark(area);
+    pick.classList.add('busy');
+    try {
+      const res = await putEntry(path, serializeEntry({ ...file.meta, area }, file.body), file.sha,
+        `área de ${path.split('/').pop()}: ${area}`).then(r => r.json());
+      file.sha = res.content.sha;
+      file.meta.area = area;
+      e.area = area;
+      areaChosen.set(path, area);
+      toast(`Marcado como ${AREA_LABEL[area].toLowerCase()}. A IA passa a usar isso como exemplo.`);
+    } catch (err) {
+      mark(prevArea);
+      toast(errMsg(err), { error: true });
+    } finally {
+      pick.classList.remove('busy');
+    }
+  });
+
   const del = $('#del');
   let armed = null;
   del.addEventListener('click', async () => {
