@@ -72,11 +72,6 @@ const fmtMonthName = new Intl.DateTimeFormat('pt-BR', { month: 'long' });
 const shortWhen = d => `${fmtShort.format(d).replace(/\./g, '')} · ${fmtTime.format(d)}`;
 const dayMonth = d => fmtDayMonth.format(d).replace(/\./g, '');
 
-function greeting(d = new Date()) {
-  const h = d.getHours();
-  return h < 5 ? ['Boa', 'noite'] : h < 12 ? ['Bom', 'dia'] : h < 18 ? ['Boa', 'tarde'] : ['Boa', 'noite'];
-}
-
 function b64encode(text) {
   let bin = '';
   for (const b of new TextEncoder().encode(text)) bin += String.fromCharCode(b);
@@ -285,74 +280,118 @@ function bindCtrlEnter(ta, btn) {
   });
 }
 
-// ---------- Escrever ----------
+// ---------- Escrever: a página do dia ----------
+
+// Data escrita como num caderno: "Terça-feira, 13 de outubro".
+const fmtDayTitle = new Intl.DateTimeFormat('pt-BR', { weekday: 'long', day: 'numeric', month: 'long' });
+const dayTitle = d => { const s = fmtDayTitle.format(d); return s[0].toUpperCase() + s.slice(1); };
+const saveKey = `${isMac ? '⌘' : 'Ctrl'} ↵`;
+
+// Escrever e editar são telas calmas: sem aura nem poeira; enquanto se digita, o cabeçalho some
+// e volta quando o mouse se mexe (ou com Esc).
+function quietMode(ta) {
+  document.body.classList.add('quiet');
+  ambient.pause();
+  const wake = () => document.body.classList.remove('typing');
+  let last = null;
+  const onMove = ev => {
+    if (last && Math.hypot(ev.clientX - last[0], ev.clientY - last[1]) > 6) wake();
+    last = [ev.clientX, ev.clientY];
+  };
+  window.addEventListener('pointermove', onMove);
+  ta.addEventListener('input', () => document.body.classList.add('typing'));
+  ta.addEventListener('keydown', e => { if (e.key === 'Escape') wake(); });
+  return { wake, stop() { window.removeEventListener('pointermove', onMove); document.body.classList.remove('quiet', 'typing'); ambient.resume(); } };
+}
+
+function dayPage({ date, stamp, text, placeholder, aria, saveLabel, leftSlot }) {
+  return `
+    <section class="page day">
+      <header class="day-head">
+        <span class="day-year">${date.getFullYear()}</span>
+        <h1 class="day-title">${esc(dayTitle(date))}</h1>
+      </header>
+      <ol class="day-log" id="log" aria-label="Pensamentos deste dia"></ol>
+      <div class="day-now">
+        <time class="stamp now" id="clock">${esc(stamp)}</time>
+        <textarea id="body" class="paper" placeholder="${esc(placeholder)}" aria-label="${esc(aria)}">${esc(text)}</textarea>
+      </div>
+      <footer class="day-bar">
+        ${leftSlot}
+        <button id="save" class="save" type="button">${esc(saveLabel)} <kbd>${saveKey}</kbd></button>
+      </footer>
+    </section>`;
+}
 
 function viewWrite() {
-  const draft = store.get(DRAFT_KEY, '');
-  const [g1, g2] = greeting();
-  $view.innerHTML = `
-    <section class="page narrow compose">
-      <header class="page-head">
-        <p class="eyebrow">${esc(fmtFull.format(new Date()))}</p>
-        <h1 class="display">${g1} <em>${g2}</em>.</h1>
-      </header>
-      <div class="composer">
-        <textarea id="body" class="paper" placeholder="O que está passando pela sua cabeça?" aria-label="Texto do pensamento">${esc(draft)}</textarea>
-        <div class="composer-bar">
-          <span id="count" class="hint"></span>
-          <button id="save" class="btn btn-primary" type="button">Guardar</button>
-        </div>
-      </div>
-      <section class="recent" id="recent" aria-label="Pensamentos recentes"></section>
-    </section>`;
-  const ta = $('#body'), count = $('#count'), btn = $('#save');
+  const seq = viewSeq;
+  const today = new Date();
+  $view.innerHTML = dayPage({
+    date: today, stamp: fmtTime.format(today), text: store.get(DRAFT_KEY, ''),
+    placeholder: 'Escreva aqui.', aria: 'Novo pensamento', saveLabel: 'Guardar',
+    leftSlot: '<span class="day-status" id="status"></span>',
+  });
+  const ta = $('#body'), status = $('#status'), btn = $('#save'), clock = $('#clock'), log = $('#log');
+  const quiet = quietMode(ta);
+  const clockTimer = setInterval(() => { clock.textContent = fmtTime.format(new Date()); }, 20_000);
+  cleanup = () => { clearInterval(clockTimer); quiet.stop(); };
+
+  // O registro do dia: o que já foi escrito hoje, em ordem, com a hora na margem.
+  const items = new Map();
+  const renderLog = () => {
+    log.innerHTML = [...items.values()].sort((a, b) => a.date - b.date).map(e => `
+      <li${e.fresh ? ' class="fresh"' : ''}><a href="#/e/${encodeURIComponent(e.path)}">
+        <time class="stamp">${e.area ? `<i class="dot dot-${esc(e.area)}"></i>` : ''}${esc(fmtTime.format(e.date))}</time>
+        <p>${e.excerpt ? esc(e.excerpt) : '<em>a IA ainda está lendo este.</em>'}</p>
+      </a></li>`).join('');
+  };
+  const addItems = list => {
+    for (const e of list) items.set(e.path, { ...e, excerpt: e.excerpt || items.get(e.path)?.excerpt, fresh: items.get(e.path)?.fresh });
+    renderLog();
+  };
+
+  let note = '';  // mensagem depois de guardar, até voltar a digitar
   const update = () => {
     const n = wordCount(ta.value);
-    count.textContent = n ? plural(n, 'palavra', 'palavras') : `${isMac ? '⌘' : 'Ctrl'} + Enter guarda`;
-    btn.disabled = !ta.value.trim();
+    btn.disabled = n === 0;
+    btn.classList.toggle('ready', n > 0);
+    status.textContent = note || (n
+      ? `rascunho salvo · ${plural(n, 'palavra', 'palavras')}`
+      : 'o rascunho fica salvo neste aparelho');
     autosize(ta);
   };
-  ta.addEventListener('input', () => { store.set(DRAFT_KEY, ta.value); update(); });
+  ta.addEventListener('input', () => { note = ''; store.set(DRAFT_KEY, ta.value); update(); });
   bindCtrlEnter(ta, btn);
   btn.addEventListener('click', async () => {
     const body = ta.value.trim();
     if (!body) return;
     btn.disabled = true;
-    btn.textContent = 'Guardando…';
+    status.textContent = 'guardando…';
     const now = new Date();
     const path = entryPath(now);
     try {
       await putEntry(path, serializeEntry({ created: isoLocal(now) }, body), null, `entrada ${entryId(now)}`);
       store.del(DRAFT_KEY);
       ta.value = '';
-      toast('Guardado. A IA organiza em ~1 min.', { href: `#/e/${encodeURIComponent(path)}` });
-      renderRecent(viewSeq);
+      addItems([{ path, date: now, excerpt: body.slice(0, 600), fresh: true }]);
+      note = `guardado às ${fmtTime.format(now)} · a IA organiza em ~1 min`;
+      quiet.wake();
     } catch (e) {
       toast(errMsg(e), { error: true });
     } finally {
-      btn.textContent = 'Guardar';
       update();
+      ta.focus();
     }
   });
   update();
   ta.focus();
   ta.setSelectionRange(ta.value.length, ta.value.length);
-  renderRecent(viewSeq);
-}
 
-async function renderRecent(seq) {
-  let data;
-  try { data = await getData(); } catch { return; }
-  const box = $('#recent');
-  if (seq !== viewSeq || !box || !data.entries.length) return;
-  box.innerHTML = `
-    <div class="section-head"><h2 class="section-label">Recentes</h2>
-      <a class="link" href="#/pensamentos">Ver todos ${icon('arrow', 14)}</a></div>
-    <ul class="recent-list">${data.entries.slice(0, 4).map((e, i) => `
-      <li style="--i:${i}"><a href="#/e/${encodeURIComponent(e.path)}">
-        <span class="when">${e.area ? `<i class="dot dot-${esc(e.area)}"></i>` : ''}${esc(shortWhen(e.date))}</span>
-        <span class="t">${e.enriched ? esc(e.title) : '<em>a IA está lendo…</em>'}</span>${icon('arrow', 16)}
-      </a></li>`).join('')}</ul>`;
+  getData().then(data => {
+    if (seq !== viewSeq) return;
+    const day = today.toDateString();
+    addItems(data.entries.filter(e => e.date.toDateString() === day));
+  }).catch(() => {});
 }
 
 // ---------- Pensamentos ----------
@@ -572,38 +611,32 @@ async function viewEntry(rawPath) {
 async function viewEdit(rawPath) {
   const seq = viewSeq;
   const path = decodeURIComponent(rawPath);
-  $view.innerHTML = '<section class="page narrow compose"><span class="sk short"></span><span class="sk tall"></span></section>';
+  const date = dateFromPath(path);
+  $view.innerHTML = '<section class="page day"><span class="sk short"></span><span class="sk tall"></span></section>';
   let file;
   try { file = await getEntry(path); } catch (e) { if (seq === viewSeq) $view.firstElementChild.innerHTML = errorBox(e); return; }
   if (seq !== viewSeq) return;
-  $view.firstElementChild.innerHTML = `
-    <a class="back" href="#/e/${encodeURIComponent(path)}">${icon('back', 16)} Voltar</a>
-    <header class="page-head">
-      <p class="eyebrow">${esc(fmtFull.format(dateFromPath(path)))}</p>
-      <h1 class="display">Editando<em>.</em></h1>
-    </header>
-    <div class="composer">
-      <textarea id="body" class="paper" aria-label="Texto do pensamento">${esc(file.body)}</textarea>
-      <div class="composer-bar">
-        <span class="hint">a IA reorganiza depois de guardar</span>
-        <button id="save" class="btn btn-primary" type="button">Guardar alterações</button>
-      </div>
-    </div>`;
+  $view.innerHTML = dayPage({
+    date, stamp: fmtTime.format(date), text: file.body,
+    placeholder: '', aria: 'Texto do pensamento', saveLabel: 'Guardar alterações',
+    leftSlot: `<a class="day-status day-cancel" href="#/e/${encodeURIComponent(path)}">cancelar e voltar</a>`,
+  });
   const ta = $('#body'), btn = $('#save');
-  ta.addEventListener('input', () => { btn.disabled = !ta.value.trim(); autosize(ta); });
+  const quiet = quietMode(ta);
+  cleanup = () => quiet.stop();
+  btn.classList.add('ready');
+  ta.addEventListener('input', () => { btn.disabled = !ta.value.trim(); btn.classList.toggle('ready', !btn.disabled); autosize(ta); });
   bindCtrlEnter(ta, btn);
   btn.addEventListener('click', async () => {
     btn.disabled = true;
-    btn.textContent = 'Guardando…';
     try {
       await putEntry(path, serializeEntry({ ...file.meta, updated: isoLocal(new Date()) }, ta.value),
         file.sha, `edita ${path.split('/').pop()}`);
-      toast('Alterações guardadas. Metadados atualizam em ~1 min.');
+      toast('Alterações guardadas. Os metadados atualizam em ~1 min.');
       location.hash = `#/e/${encodeURIComponent(path)}`;
     } catch (e) {
       toast(errMsg(e), { error: true });
       btn.disabled = false;
-      btn.textContent = 'Guardar alterações';
     }
   });
   autosize(ta);
