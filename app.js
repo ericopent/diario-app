@@ -107,8 +107,10 @@ class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
-async function gh(path, { method = 'GET', body, raw = false } = {}) {
-  const res = await fetch(`https://api.github.com/repos/${cfg.repo}${path}`, {
+const gh = (path, opts) => api(`/repos/${cfg.repo}${path}`, opts);
+
+async function api(path, { method = 'GET', body, raw = false } = {}) {
+  const res = await fetch(`https://api.github.com${path}`, {
     method,
     cache: 'no-cache',
     headers: {
@@ -421,6 +423,39 @@ async function viewTags() {
     </section>`;
 }
 
+// Testa token → repo → conteúdo, um passo por vez, para o erro dizer o que ajustar no token.
+async function diagnose() {
+  let login = '';
+  try {
+    login = (await api('/user').then(r => r.json())).login;
+  } catch (e) {
+    if (e.status === 401) return { error: 'Token inválido ou expirado: confira se colou o token inteiro (começa com github_pat_).' };
+  }
+  const who = login ? `O token de @${login}` : 'O token';
+  let info;
+  try {
+    info = await gh('').then(r => r.json());
+  } catch (e) {
+    if (e.status === 404) {
+      return { error: `${who} é válido, mas não enxerga ${cfg.repo}. Em github.com/settings/personal-access-tokens, ` +
+        `abra o token e mude "Repository access" para "Only select repositories" com ${cfg.repo} marcado. ` +
+        'O padrão, "Public repositories", não dá acesso a repos privados.' };
+    }
+    throw e;
+  }
+  try {
+    const { entries } = await loadAll();
+    return { info, entries };
+  } catch (e) {
+    if (e.status === 403) {
+      return { error: `${who} enxerga ${info.full_name}, mas não pode ler o conteúdo. Abra o token e dê ` +
+        '"Permissions → Repository → Contents: Read and write".' };
+    }
+    if (e.status === 404 || e.status === 409) return { error: `Branch "${cfg.branch}" não existe em ${info.full_name}.` };
+    throw e;
+  }
+}
+
 function viewConfig() {
   $view.innerHTML = `
     <section class="config">
@@ -447,16 +482,19 @@ function viewConfig() {
   repo.value = cfg.repo;
   branch.value = cfg.branch;
   $('#test').addEventListener('click', async () => {
-    cfg = { token: token.value.trim(), repo: repo.value.trim(), branch: branch.value.trim() || 'main' };
+    const repoName = repo.value.trim().replace(/^https?:\/\/github\.com\//, '').replace(/(\.git)?\/*$/, '');
+    cfg = { token: token.value.trim(), repo: repoName, branch: branch.value.trim() || 'main' };
     store.set(CFG_KEY, cfg);
+    repo.value = cfg.repo;
     cache = null;
     status.textContent = 'Testando…';
     try {
-      const info = await gh('').then(r => r.json());
-      const { entries } = await loadAll();
-      status.innerHTML = info.private
-        ? `Conectado a <b>${esc(info.full_name)}</b> (privado) · ${plural(entries.length, 'entrada', 'entradas')}.`
-        : `<span class="danger">Atenção: ${esc(info.full_name)} é <b>público</b>. Torne-o privado antes de escrever.</span>`;
+      const r = await diagnose();
+      status.innerHTML = r.error
+        ? `<span class="danger">${esc(r.error)}</span>`
+        : r.info.private
+          ? `Conectado a <b>${esc(r.info.full_name)}</b> (privado) · ${plural(r.entries.length, 'entrada', 'entradas')}.`
+          : `<span class="danger">Atenção: ${esc(r.info.full_name)} é <b>público</b>. Torne-o privado antes de escrever.</span>`;
     } catch (e) { status.innerHTML = `<span class="danger">${esc(errMsg(e))}</span>`; }
   });
   $('#forget').addEventListener('click', () => {
